@@ -14,6 +14,19 @@ import 'package:tuple/tuple.dart';
 
 import 'layer.dart';
 
+enum EvictErrorTileStrategy {
+  // never evict error Tiles
+  none,
+  // evict error Tiles during _pruneTiles / _abortLoading calls
+  dispose,
+  // evict error Tiles which are not visible anymore but respect margin (see keepBuffer option)
+  // (Tile's zoom level not equals current _tileZoom or Tile is out of viewport)
+  notVisibleRespectMargin,
+  // evict error Tiles which are not visible anymore
+  // (Tile's zoom level not equals current _tileZoom or Tile is out of viewport)
+  notVisible,
+}
+
 typedef ErrorTileCallBack = void Function(Tile tile, dynamic error);
 
 /// Describes the needed properties to create a tile-based layer.
@@ -189,6 +202,11 @@ class TileLayerOptions extends LayerOptions {
   /// This callback will be execute if some errors by getting tile
   final ErrorTileCallBack errorTileCallback;
 
+  // If a Tile was loaded with error and if strategy isn't `none` then TileProvider
+  // will be asked to evict Image based on current strategy
+  // (see #576 - even Error Images are cached in flutter)
+  final EvictErrorTileStrategy evictErrorTileStrategy;
+
   TileLayerOptions({
     Key key,
     this.urlTemplate,
@@ -224,6 +242,7 @@ class TileLayerOptions extends LayerOptions {
     this.overrideTilesWhenUrlChanges = false,
     this.retinaMode = false,
     this.errorTileCallback,
+    this.evictErrorTileStrategy = EvictErrorTileStrategy.none,
     rebuild,
   })  : updateInterval =
             updateInterval <= 0 ? null : Duration(milliseconds: updateInterval),
@@ -525,7 +544,8 @@ class _TileLayerState extends State<TileLayer> with TickerProviderStateMixin {
       var tile = _tiles[key];
 
       tile.tileReady = null;
-      tile.dispose();
+      tile.dispose(tile.loadError &&
+          options.evictErrorTileStrategy != EvictErrorTileStrategy.none);
       _tiles.remove(key);
     }
   }
@@ -884,6 +904,8 @@ class _TileLayerState extends State<TileLayer> with TickerProviderStateMixin {
       }
     }
 
+    _evictErrorTilesBasedOnStrategy(tileRange);
+
     // sort tile queue to load tiles in order of their distance to center
     queue.sort((a, b) =>
         (a.distanceTo(tileCenter) - b.distanceTo(tileCenter)).toInt());
@@ -929,7 +951,8 @@ class _TileLayerState extends State<TileLayer> with TickerProviderStateMixin {
       return;
     }
 
-    tile.dispose();
+    tile.dispose(tile.loadError &&
+        options.evictErrorTileStrategy != EvictErrorTileStrategy.none);
     _tiles.remove(key);
   }
 
@@ -947,6 +970,46 @@ class _TileLayerState extends State<TileLayer> with TickerProviderStateMixin {
     );
 
     tile.loadTileImage();
+  }
+
+  void _evictErrorTilesBasedOnStrategy(Bounds tileRange) {
+    if (options.evictErrorTileStrategy ==
+        EvictErrorTileStrategy.notVisibleRespectMargin) {
+      var toRemove = <String>[];
+      for (var entry in _tiles.entries) {
+        var tile = entry.value;
+
+        if (tile.loadError && !tile.current) {
+          toRemove.add(entry.key);
+        }
+      }
+
+      for (var key in toRemove) {
+        var tile = _tiles[key];
+
+        tile.dispose(true);
+        _tiles.remove(key);
+      }
+    } else if (options.evictErrorTileStrategy ==
+        EvictErrorTileStrategy.notVisible) {
+      var toRemove = <String>[];
+      for (var entry in _tiles.entries) {
+        var tile = entry.value;
+        var c = tile.coords;
+
+        if (tile.loadError &&
+            (!tile.current || !tileRange.contains(CustomPoint(c.x, c.y)))) {
+          toRemove.add(entry.key);
+        }
+      }
+
+      for (var key in toRemove) {
+        var tile = _tiles[key];
+
+        tile.dispose(true);
+        _tiles.remove(key);
+      }
+    }
   }
 
   void _tileReady(Coords<double> coords, dynamic error, Tile tile) {
@@ -1101,10 +1164,13 @@ class Tile implements Comparable<Tile> {
   // call this before GC!
   void dispose([bool evict = false]) {
     if (evict && imageProvider != null) {
-      imageProvider
-          .evict()
-          .then((bool succ) => print('evict tile: $coords -> $succ'))
-          .catchError((error) => print('evict tile: $coords -> $error'));
+      try {
+        imageProvider.evict().catchError(print);
+      } catch (e) {
+        // this may be never called because catchError will handle errors, however
+        // we want to avoid random crashes like in #444 / #536
+        print(e);
+      }
     }
 
     animationController?.removeStatusListener(_onAnimateEnd);
